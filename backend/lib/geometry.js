@@ -1,7 +1,4 @@
 // Claude 使用状況ウィジェットの純粋ロジック（座標計算・位置の永続化）。
-// この関数群は claude-usage.jsx にも同一実装がインライン展開されている。
-// （Übersicht はウィジェットをバンドルなしで単独ロードするため import 不可）
-// ロジックを変更したら両方を同期し、ここのテストで担保すること。
 
 export const PANEL_WIDTH = 320; // パネル幅(px)。widget の width と一致させる
 export const MARGIN = 8; // 上端からのマージン(px)

@@ -2,7 +2,6 @@
 usage.json
 .claude-usage-widget/
 
-# 依存・OS
+# 依存
 node_modules/
-.DS_Store
 bun.lockb

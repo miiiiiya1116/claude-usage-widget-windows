@@ -1,0 +1,505 @@
+# Claude Code 使用状況ウィジェット (Windows / PowerShell + WPF)
+# デスクトップ右上に半透明パネルで使用率を常時表示する。
+# 追加インストール不要（Windows 標準の PowerShell 5.1 + .NET Framework で動作）。
+
+# --- 設定 ---
+$PANEL_WIDTH    = 320
+$MARGIN         = 8
+$MARGIN_RIGHT   = 8
+$WARN           = 80
+$DANGER         = 95
+$REFRESH_INTERVAL_SEC = 30
+$OK_INTERVAL_SEC      = 300
+$BACKOFF_SEC          = 900
+
+$WIDGET_HOME = Join-Path $env:USERPROFILE ".claude-usage-widget"
+$CACHE_FILE  = Join-Path $WIDGET_HOME "usage.json"
+$POS_FILE    = Join-Path $WIDGET_HOME "position.json"
+$CRED_FILE   = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+$ENDPOINT    = "https://api.anthropic.com/api/oauth/usage"
+
+if (-not (Test-Path $WIDGET_HOME)) { New-Item -ItemType Directory -Path $WIDGET_HOME -Force | Out-Null }
+
+# --- 多重起動防止 ---
+# 1) 自分以外の claude-usage.ps1 プロセスを先に停止（古いコードで動いているものも含め確実に掃除）
+try {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*claude-usage.ps1*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+} catch {}
+
+# 2) 名前付き Mutex で排他制御（同時起動のレースコンディションも防ぐ）
+$script:widgetMutex = [System.Threading.Mutex]::new($false, "Global\ClaudeUsageWidget")
+if (-not $script:widgetMutex.WaitOne(3000)) {
+    # 3秒待っても取れなければ諦めて終了
+    $script:widgetMutex.Dispose()
+    exit 0
+}
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+
+# --- トークン読み取り ---
+function Get-OAuthToken {
+    if (-not (Test-Path $CRED_FILE)) { return $null }
+    try {
+        $json = Get-Content $CRED_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+        $tok = $null
+        if ($json.claudeAiOauth -and $json.claudeAiOauth.accessToken) {
+            $tok = $json.claudeAiOauth.accessToken
+        }
+        elseif ($json.accessToken) {
+            $tok = $json.accessToken
+        }
+        return $tok
+    }
+    catch {
+        return $null
+    }
+}
+
+# --- API 取得 ---
+function Fetch-Usage {
+    $now = [DateTimeOffset]::UtcNow
+    $cache = Load-Cache
+
+    # スロットリング
+    if ($cache -and $cache.next_fetch_after) {
+        try {
+            $nextFetch = [DateTimeOffset]::Parse($cache.next_fetch_after)
+            if ($now -lt $nextFetch) { return $cache }
+        }
+        catch {}
+    }
+
+    $token = Get-OAuthToken
+    if (-not $token) {
+        $result = New-EmptyCache
+        $result.ok = $false
+        $result.error = "no_credentials"
+        $result.next_fetch_after = $now.AddSeconds($OK_INTERVAL_SEC).ToString("o")
+        if ($cache) {
+            $result.session = $cache.session
+            $result.weekly = $cache.weekly
+            $result.weekly_opus = $cache.weekly_opus
+            $result.weekly_sonnet = $cache.weekly_sonnet
+            $result.fetched_at = $cache.fetched_at
+            $result.stale = $true
+        }
+        Save-Cache $result
+        return $result
+    }
+
+    try {
+        $headers = @{
+            "Authorization"  = "Bearer $token"
+            "anthropic-beta" = "oauth-2025-04-20"
+        }
+        $webResp = Invoke-WebRequest -Uri $ENDPOINT -Headers $headers -Method Get -UseBasicParsing -ErrorAction Stop
+        $response = $webResp.Content | ConvertFrom-Json
+
+        $result = @{
+            ok               = $true
+            stale            = $false
+            error            = $null
+            fetched_at       = $now.ToString("o")
+            next_fetch_after = $now.AddSeconds($OK_INTERVAL_SEC).ToString("o")
+            session          = Format-Slot $response.five_hour
+            weekly           = Format-Slot $response.seven_day
+            weekly_opus      = Format-Slot $response.seven_day_opus
+            weekly_sonnet    = Format-Slot $response.seven_day_sonnet
+        }
+        Save-Cache $result
+        return $result
+    }
+    catch {
+        $statusCode = 0
+        $retryAfter = 0
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+            try {
+                $raHeader = $_.Exception.Response.Headers["Retry-After"]
+                if ($raHeader) { $retryAfter = [int]$raHeader }
+            } catch {}
+        }
+
+        $backoff = $OK_INTERVAL_SEC
+        $errMsg = "network: " + $_.Exception.Message
+        if ($statusCode -eq 429) {
+            if ($retryAfter -gt 0) {
+                $backoff = $retryAfter + 5
+            } elseif ($cache -and $cache.fetched_at) {
+                $backoff = $BACKOFF_SEC
+            } else {
+                $backoff = 120
+            }
+            $errMsg = "rate_limited(429)"
+        }
+        elseif ($statusCode -gt 0) {
+            $errMsg = "http_$statusCode"
+        }
+
+        $result = New-EmptyCache
+        $result.error = $errMsg
+        $result.next_fetch_after = $now.AddSeconds($backoff).ToString("o")
+        if ($cache) {
+            $result.ok = $cache.ok
+            $result.session = $cache.session
+            $result.weekly = $cache.weekly
+            $result.weekly_opus = $cache.weekly_opus
+            $result.weekly_sonnet = $cache.weekly_sonnet
+            $result.fetched_at = $cache.fetched_at
+            $result.stale = $true
+        }
+        Save-Cache $result
+        return $result
+    }
+}
+
+function Format-Slot($raw) {
+    if (-not $raw) { return $null }
+    if ($null -eq $raw.utilization) { return $null }
+    return @{ pct = [double]$raw.utilization; resets_at = $raw.resets_at }
+}
+
+function New-EmptyCache {
+    return @{
+        ok = $false; stale = $false; error = $null
+        fetched_at = $null; next_fetch_after = $null
+        session = $null; weekly = $null; weekly_opus = $null; weekly_sonnet = $null
+    }
+}
+
+function Load-Cache {
+    if (-not (Test-Path $CACHE_FILE)) { return $null }
+    try { return Get-Content $CACHE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+}
+
+function Save-Cache($data) {
+    try { $data | ConvertTo-Json -Depth 4 | Set-Content $CACHE_FILE -Encoding UTF8 }
+    catch {}
+}
+
+# --- 位置管理 ---
+function Load-Position {
+    if (Test-Path $POS_FILE) {
+        try {
+            $p = Get-Content $POS_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $p.x -and $null -ne $p.y) { return $p }
+        }
+        catch {}
+    }
+    return Get-InitialPosition
+}
+
+function Get-InitialPosition {
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $x = [Math]::Max($workArea.Left, $workArea.Right - $PANEL_WIDTH - $MARGIN_RIGHT)
+    $y = $workArea.Top + $MARGIN
+    return @{ x = [int]$x; y = [int]$y }
+}
+
+function Save-Position($pos) {
+    try { $pos | ConvertTo-Json | Set-Content $POS_FILE -Encoding UTF8 }
+    catch {}
+}
+
+# --- 表示ヘルパー ---
+function Get-BarColor($pct) {
+    if ($pct -ge $DANGER) { return "#FFFF5A52" }
+    if ($pct -ge $WARN)   { return "#FFFFAE42" }
+    return "#FF4A8CFF"
+}
+
+function Get-Countdown($resetsAt) {
+    if (-not $resetsAt) { return [string][char]0x2014 }
+    try {
+        $diff = [DateTimeOffset]::Parse($resetsAt) - [DateTimeOffset]::Now
+        if ($diff.TotalSeconds -le 0) { return [string]([char]0x307E + [char]0x3082 + [char]0x306A + [char]0x304F + [char]0x30EA + [char]0x30BB + [char]0x30C3 + [char]0x30C8) }
+        $h = [Math]::Floor($diff.TotalHours)
+        $m = $diff.Minutes
+        if ($h -gt 0) { return ($([char]0x3042) + [string]([char]0x3068) + " " + $h + [string]([char]0x6642) + [string]([char]0x9593) + $m + [string]([char]0x5206)) }
+        return ($([char]0x3042) + [string]([char]0x3068) + " " + $m + [string]([char]0x5206))
+    }
+    catch { return [string][char]0x2014 }
+}
+
+function Get-ResetClock($resetsAt) {
+    if (-not $resetsAt) { return [string][char]0x2014 }
+    try {
+        $d = [DateTimeOffset]::Parse($resetsAt).LocalDateTime
+        $wdNames = @([string][char]0x65E5, [string][char]0x6708, [string][char]0x706B, [string][char]0x6C34, [string][char]0x6728, [string][char]0x91D1, [string][char]0x571F)
+        $wd = $wdNames[[int]$d.DayOfWeek]
+        $min = $d.Minute.ToString("D2")
+        return ("{0}/{1}({2}) {3}:{4} " -f $d.Month, $d.Day, $wd, $d.Hour, $min) + [string]([char]0x30EA + [char]0x30BB + [char]0x30C3 + [char]0x30C8)
+    }
+    catch { return [string][char]0x2014 }
+}
+
+# --- WPF UI 構築 ---
+[xml]$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Claude Usage Widget"
+        WindowStyle="None" AllowsTransparency="True" Topmost="True"
+        ShowInTaskbar="False" ResizeMode="NoResize"
+        Width="320" SizeToContent="Height"
+        Background="Transparent">
+    <Border Name="PanelBorder" CornerRadius="10"
+            Background="#D01C1C1E" BorderBrush="#14FFFFFF" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="24" ShadowDepth="6" Opacity="0.35" Color="Black"/>
+        </Border.Effect>
+        <StackPanel Margin="12,8,12,8">
+            <Grid Name="Header" Margin="0,0,0,6" Cursor="SizeAll">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Name="TitleText" Grid.Column="0"
+                           Text="CLAUDE" FontSize="11" FontWeight="Bold"
+                           Foreground="#D9E8E8EA" VerticalAlignment="Center"/>
+                <TextBlock Name="StatusText" Grid.Column="1"
+                           Text="" FontSize="10" Foreground="#80E8E8EA"
+                           VerticalAlignment="Center"/>
+            </Grid>
+            <Grid Margin="0,0,0,2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Name="SessionLabel" Grid.Column="0"
+                           FontSize="12" FontWeight="SemiBold" Foreground="#E8E8EA"/>
+                <TextBlock Name="SessionPct" Grid.Column="1"
+                           FontSize="12" Foreground="#D9E8E8EA"/>
+            </Grid>
+            <Border Height="5" CornerRadius="2.5" Background="#24FFFFFF" Margin="0,0,0,2">
+                <Border Name="SessionBar" Height="5" CornerRadius="2.5"
+                        Background="#FF4A8CFF" HorizontalAlignment="Left" Width="0"/>
+            </Border>
+            <TextBlock Name="SessionSub" FontSize="11" Foreground="#99E8E8EA" Margin="0,0,0,6"/>
+            <Grid Margin="0,0,0,2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Name="WeeklyLabel" Grid.Column="0"
+                           FontSize="12" FontWeight="SemiBold" Foreground="#E8E8EA"/>
+                <TextBlock Name="WeeklyPct" Grid.Column="1"
+                           FontSize="12" Foreground="#D9E8E8EA"/>
+            </Grid>
+            <Border Height="5" CornerRadius="2.5" Background="#24FFFFFF" Margin="0,0,0,2">
+                <Border Name="WeeklyBar" Height="5" CornerRadius="2.5"
+                        Background="#FF4A8CFF" HorizontalAlignment="Left" Width="0"/>
+            </Border>
+            <TextBlock Name="WeeklySub" FontSize="11" Foreground="#99E8E8EA" Margin="0,0,0,0"/>
+            <Grid Name="OpusRow" Margin="0,6,0,2" Visibility="Collapsed">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Name="OpusLabel" Grid.Column="0"
+                           FontSize="12" FontWeight="SemiBold" Foreground="#E8E8EA"/>
+                <TextBlock Name="OpusPct" Grid.Column="1"
+                           FontSize="12" Foreground="#D9E8E8EA"/>
+            </Grid>
+            <Border Name="OpusBarContainer" Height="5" CornerRadius="2.5"
+                    Background="#24FFFFFF" Margin="0,0,0,2" Visibility="Collapsed">
+                <Border Name="OpusBar" Height="5" CornerRadius="2.5"
+                        Background="#FF4A8CFF" HorizontalAlignment="Left" Width="0"/>
+            </Border>
+            <TextBlock Name="OpusSub" FontSize="11"
+                       Foreground="#99E8E8EA" Visibility="Collapsed"/>
+        </StackPanel>
+    </Border>
+</Window>
+'@
+
+$reader = [System.Xml.XmlNodeReader]::new($xaml)
+$window = [System.Windows.Markup.XamlReader]::Load($reader)
+
+# 名前付き要素の取得
+$header      = $window.FindName("Header")
+$titleText   = $window.FindName("TitleText")
+$statusText  = $window.FindName("StatusText")
+$sessionLabel = $window.FindName("SessionLabel")
+$sessionPct  = $window.FindName("SessionPct")
+$sessionBar  = $window.FindName("SessionBar")
+$sessionSub  = $window.FindName("SessionSub")
+$weeklyLabel = $window.FindName("WeeklyLabel")
+$weeklyPct   = $window.FindName("WeeklyPct")
+$weeklyBar   = $window.FindName("WeeklyBar")
+$weeklySub   = $window.FindName("WeeklySub")
+$opusRow     = $window.FindName("OpusRow")
+$opusLabel   = $window.FindName("OpusLabel")
+$opusPct     = $window.FindName("OpusPct")
+$opusBar     = $window.FindName("OpusBar")
+$opusBarContainer = $window.FindName("OpusBarContainer")
+$opusSub     = $window.FindName("OpusSub")
+
+# 日本語テキスト設定（エンコーディング問題回避）
+$titleText.Text   = "CLAUDE " + [string]([char]0x4F7F + [char]0x7528 + [char]0x72B6 + [char]0x6CC1)
+$sessionLabel.Text = [string]([char]0x73FE + [char]0x5728 + [char]0x306E + [char]0x30BB + [char]0x30C3 + [char]0x30B7 + [char]0x30E7 + [char]0x30F3)
+$weeklyLabel.Text  = [string]([char]0x9031 + [char]0x9593 + [char]0x5236 + [char]0x9650 + [char]0xFF08 + [char]0x5168 + [char]0x4F53 + [char]0xFF09)
+$opusLabel.Text    = [string]([char]0x9031 + [char]0x9593) + " Opus"
+
+# --- ウィンドウ位置 ---
+$pos = Load-Position
+$window.Left = $pos.x
+$window.Top  = $pos.y
+
+# --- ドラッグ ---
+$script:isDragging = $false
+$script:dragOffset = @{ x = 0; y = 0 }
+
+$header.Add_MouseLeftButtonDown({
+    param($s, $e)
+    if ($e.ClickCount -eq 2) {
+        $initPos = Get-InitialPosition
+        $window.Left = $initPos.x
+        $window.Top  = $initPos.y
+        Save-Position $initPos
+        return
+    }
+    $script:isDragging = $true
+    $script:dragStart = [System.Windows.Forms.Cursor]::Position
+    $script:windowStart = @{ x = $window.Left; y = $window.Top }
+    $header.CaptureMouse()
+})
+
+$header.Add_MouseMove({
+    param($s, $e)
+    if (-not $script:isDragging) { return }
+    $curPos = [System.Windows.Forms.Cursor]::Position
+    $dpiScale = [System.Windows.PresentationSource]::FromVisual($window).CompositionTarget.TransformFromDevice.M11
+    $deltaX = ($curPos.X - $script:dragStart.X) * $dpiScale
+    $deltaY = ($curPos.Y - $script:dragStart.Y) * $dpiScale
+    $newX = $script:windowStart.x + $deltaX
+    $newY = $script:windowStart.y + $deltaY
+
+    # WPF の WorkArea で制限（DPI に依存しない座標）
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $panelH = $window.ActualHeight
+    if ($panelH -lt 10) { $panelH = 150 }
+    $minX = $workArea.Left + $MARGIN
+    $minY = $workArea.Top + $MARGIN
+    $maxX = $workArea.Right - $PANEL_WIDTH - $MARGIN
+    $maxY = $workArea.Bottom - $panelH - $MARGIN
+
+    $window.Left = [Math]::Min([Math]::Max($minX, $newX), $maxX)
+    $window.Top  = [Math]::Min([Math]::Max($minY, $newY), $maxY)
+})
+
+$header.Add_MouseLeftButtonUp({
+    param($s, $e)
+    if (-not $script:isDragging) { return }
+    $script:isDragging = $false
+    $header.ReleaseMouseCapture()
+    Save-Position @{ x = [int]$window.Left; y = [int]$window.Top }
+})
+
+# --- UI 更新関数 ---
+function Update-UI($data) {
+    $dash = [string][char]0x2014
+    $barMaxWidth = $PANEL_WIDTH - 24
+
+    if (-not $data) {
+        $titleText.Text = "Claude " + [string]([char]0x4F7F + [char]0x7528 + [char]0x72B6 + [char]0x6CC1) + ": " + [string]([char]0x8AAD + [char]0x307F + [char]0x8FBC + [char]0x307F + [char]0x4E2D) + "..."
+        return
+    }
+
+    if (-not $data.session -and -not $data.weekly) {
+        $statusText.Text = ""
+        $sessionPct.Text = $dash
+        $sessionBar.Width = 0
+        $errText = ""
+        if ($data.error) { $errText = " (" + $data.error + ")" }
+        $sessionSub.Text = [string]([char]0x30C7 + [char]0x30FC + [char]0x30BF + [char]0x53D6 + [char]0x5F97 + [char]0x5F85 + [char]0x3061) + $errText
+        $weeklyPct.Text = $dash
+        $weeklyBar.Width = 0
+        $weeklySub.Text = ""
+        return
+    }
+
+    # ステータス表示
+    if ($data.stale) {
+        $refreshChar = [string][char]0x27F3
+        if ($data.error -eq "rate_limited(429)") {
+            $statusText.Text = $refreshChar + " " + [string]([char]0x5F85 + [char]0x6A5F + [char]0x4E2D)
+        }
+        else {
+            $statusText.Text = $refreshChar + " " + [string]([char]0x66F4 + [char]0x65B0 + [char]0x5F85 + [char]0x3061)
+        }
+    }
+    else {
+        $statusText.Text = ""
+    }
+
+    # セッション
+    if ($data.session) {
+        $pct = [Math]::Round($data.session.pct)
+        $sessionPct.Text = "$pct%"
+        $sessionBar.Width = [Math]::Min($pct, 100) / 100.0 * $barMaxWidth
+        $sessionBar.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString((Get-BarColor $pct))
+        $sessionSub.Text = Get-Countdown $data.session.resets_at
+    }
+    else {
+        $sessionPct.Text = $dash
+        $sessionBar.Width = 0
+        $sessionSub.Text = $dash
+    }
+
+    # 週間
+    if ($data.weekly) {
+        $pct = [Math]::Round($data.weekly.pct)
+        $weeklyPct.Text = "$pct%"
+        $weeklyBar.Width = [Math]::Min($pct, 100) / 100.0 * $barMaxWidth
+        $weeklyBar.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString((Get-BarColor $pct))
+        $weeklySub.Text = Get-ResetClock $data.weekly.resets_at
+    }
+    else {
+        $weeklyPct.Text = $dash
+        $weeklyBar.Width = 0
+        $weeklySub.Text = $dash
+    }
+
+    # Opus
+    if ($data.weekly_opus) {
+        $opusRow.Visibility = "Visible"
+        $opusBarContainer.Visibility = "Visible"
+        $opusSub.Visibility = "Visible"
+        $pct = [Math]::Round($data.weekly_opus.pct)
+        $opusPct.Text = "$pct%"
+        $opusBar.Width = [Math]::Min($pct, 100) / 100.0 * $barMaxWidth
+        $opusBar.Background = [System.Windows.Media.BrushConverter]::new().ConvertFromString((Get-BarColor $pct))
+        $opusSub.Text = Get-ResetClock $data.weekly_opus.resets_at
+    }
+    else {
+        $opusRow.Visibility = "Collapsed"
+        $opusBarContainer.Visibility = "Collapsed"
+        $opusSub.Visibility = "Collapsed"
+    }
+}
+
+# --- 初回データ取得 & 表示 ---
+$initialData = Fetch-Usage
+Update-UI $initialData
+
+# --- タイマーで定期更新 ---
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromSeconds($REFRESH_INTERVAL_SEC)
+$timer.Add_Tick({
+    $data = Fetch-Usage
+    Update-UI $data
+})
+$timer.Start()
+
+# --- ウィンドウ表示 ---
+$window.ShowDialog() | Out-Null
+
+# Mutex 解放
+try { $script:widgetMutex.ReleaseMutex() } catch {}
+$script:widgetMutex.Dispose()

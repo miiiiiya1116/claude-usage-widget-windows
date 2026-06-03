@@ -1,6 +1,10 @@
-# claude-usage-widget
+# claude-usage-widget-windows
 
-macOS のデスクトップ右上に、**Claude Code の使用状況**（現在の5時間セッション・週間制限の使用率%とリセット時刻）を常時表示する [Übersicht](https://tracesof.net/uebersicht/) ウィジェットです。
+Windows のデスクトップ右上に、**Claude Code の使用状況**（現在の5時間セッション・週間制限の使用率%とリセット時刻）を常時表示する PowerShell + WPF ウィジェットです。
+
+## 由来
+
+[fourn9/claude-usage-widget](https://github.com/fourn9/claude-usage-widget)（macOS / Übersicht 版）をベースにした **Windows 移植版** です。表示ロジックや API 取得の考え方は原作者 [fourn9](https://github.com/fourn9) 氏の実装に基づいており、MIT ライセンスの条件に従い配布しています（[LICENSE](LICENSE) を参照）。
 
 ```
 ┌──────────────────────────────────┐
@@ -17,6 +21,7 @@ macOS のデスクトップ右上に、**Claude Code の使用状況**（現在�
 - 使用率に応じてバーの色が変わる（〜80% 青 / 80%〜 橙 / 95%〜 赤）。
 - セッションは「あと◯時間◯分」、週間は「何曜日の何時にリセット」を表示。
 - パネルはドラッグで好きな位置に移動でき、位置を記憶する（再起動後も維持）。
+- **追加インストール不要**（Windows 標準の PowerShell + .NET Framework のみで動作）。
 
 > **⚠️ 非公式ツールです。** このウィジェットは Anthropic 非公式・非ドキュメントのエンドポイント
 > (`https://api.anthropic.com/api/oauth/usage`) を利用しています。Anthropic 公式の製品ではなく、
@@ -28,21 +33,21 @@ macOS のデスクトップ右上に、**Claude Code の使用状況**（現在�
 ## 仕組み
 
 ```
-  Übersicht
-  ┌─────────────────────────┐    30秒ごとに command を実行
-  │ widgets/claude-usage.jsx│ ──────────────┐
-  │ （表示・ドラッグ・%バー）│ ←── stdout ───┤
-  └─────────────────────────┘               │
-                                             ▼
-  ~/.claude-usage-widget/fetch-usage.ts （bun で実行）
-   ├─ macOS Keychain "Claude Code-credentials" から OAuth トークンを読む（出力しない）
+  PowerShell + WPF
+  ┌──────────────────────────┐    30秒タイマーで再描画
+  │ claude-usage.ps1         │
+  │ （半透明パネル・%バー）    │
+  └──────────────────────────┘
+              │
+              ▼
+  データ取得（同一スクリプト内）
+   ├─ ~/.claude/.credentials.json から OAuth トークンを読む（出力しない）
    ├─ 5分に1回だけ API を実体取得（429 を踏んだら15分バックオフ）
-   └─ 結果を usage.json にキャッシュし stdout に JSON を出力
+   └─ 結果を usage.json にキャッシュし UI を更新
 ```
 
-- **表示と取得を分離**：ウィジェットは30秒ごとに再描画されるが、API への実アクセスはフェッチャ側で5分に間引く。これでレート制限を踏みにくくしている。
-- **トークンは読むだけ**：`security find-generic-password` で Keychain の1項目だけを読み、`Bearer` ヘッダに載せるのみ。ファイルにも標準出力にも**書き出さない**。
-- **座標計算は純粋関数＋テスト**：ドラッグ位置のクランプ・永続化ロジックは `backend/lib/geometry.js` に切り出し、`bun test` で担保（macOS や Übersicht に非依存）。
+- **表示と取得を分離**：画面更新は30秒ごとだが、API への実アクセスは5分に間引く。これでレート制限を踏みにくくしている。
+- **トークンは読むだけ**：`~/.claude/.credentials.json` から1項目だけを読み、`Bearer` ヘッダに載せるのみ。標準出力にも**書き出さない**。
 
 ---
 
@@ -50,93 +55,73 @@ macOS のデスクトップ右上に、**Claude Code の使用状況**（現在�
 
 | 要件 | 備考 |
 |------|------|
-| macOS | Übersicht は macOS 専用 |
-| [Übersicht](https://tracesof.net/uebersicht/) | デスクトップウィジェット基盤。インストールして一度起動しておく |
-| [bun](https://bun.sh/) | フェッチャの実行に使用（`curl -fsSL https://bun.sh/install \| bash`） |
-| Claude Code にログイン済み | Keychain に `Claude Code-credentials` がある状態。`claude` を一度起動してログインしておく |
+| Windows 10 以降 | PowerShell 5.1+ と .NET Framework（WPF）は標準搭載 |
+| Claude Code にログイン済み | `~/.claude/.credentials.json` が存在する状態。`claude` を一度起動してログインしておく |
+
+> 追加インストールは一切不要です。
 
 ---
 
 ## インストール
 
-```bash
-git clone https://github.com/fourn9/claude-usage-widget.git
-cd claude-usage-widget
-./install.sh
+```powershell
+git clone https://github.com/miiiiiya1116/claude-usage-widget-windows.git
+cd claude-usage-widget-windows
+.\install.ps1
 ```
 
-`install.sh` は次を自動で行います。
+`install.ps1` は次を自動で行います。
 
-1. `bun` の絶対パスと Übersicht の widgets フォルダを検出
-2. `backend/`（フェッチャ・純粋ロジック）を `~/.claude-usage-widget/` にコピー
-3. `widget/claude-usage.jsx` のプレースホルダ（bun と backend の絶対パス）を実パスに置換して
-   `~/Library/Application Support/Übersicht/widgets/claude-usage.jsx` に配置
+1. `windows/claude-usage.ps1` を `~/.claude-usage-widget/` にコピー
+2. スタートアップショートカットを作成（ログイン時に自動起動）
 
-インストール後、Übersicht のメニューから **Refresh All Widgets** を実行すると右上にパネルが出ます。
+インストール後、デスクトップ右上に半透明パネルが表示されます。
 （初回はデータ取得まで最大5分ほどかかることがあります。）
+
+### インストール確認
+
+以下の2つが両方 `True` を返せば、ログイン時の自動起動が正しく設定されています。
+
+```powershell
+Test-Path "$env:USERPROFILE\.claude-usage-widget\claude-usage.ps1"
+Test-Path "$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\Claude Usage Widget.lnk"
+```
+
+### 手動起動
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\.claude-usage-widget\claude-usage.ps1"
+```
 
 ### アンインストール
 
-```bash
-./uninstall.sh
+```powershell
+.\uninstall.ps1
 ```
 
 ---
 
-## 手動インストール（install.sh を使わない場合）
+## ドラッグ操作
 
-1. `backend/fetch-usage.ts` と `backend/lib/` を `~/.claude-usage-widget/` 配下にコピー。
-2. `widget/claude-usage.jsx` をコピーし、先頭の `command` のプレースホルダを実パスに置換：
-   - `__BUN_BIN__` → `which bun` の結果（例 `/Users/you/.bun/bin/bun`）
-   - `__WIDGET_HOME__` → `~/.claude-usage-widget` の絶対パス（例 `/Users/you/.claude-usage-widget`）
-3. 置換後の `claude-usage.jsx` を `~/Library/Application Support/Übersicht/widgets/` に置く。
-4. Übersicht を Refresh。
-
-> Übersicht のプロセスは PATH が最小限のことが多いため、`command` には **bun の絶対パス**を入れます（`bun` だけだと見つからないことがある）。
-
----
-
-## ドラッグ操作を有効にする（任意）
-
-Übersicht のウィジェットは既定で「クリックスルー」（マウス操作が背後のデスクトップに抜ける）です。
-パネルをドラッグで動かすには、Übersicht のインタラクションモードを使います。
-
-1. Übersicht メニュー > **Preferences** > インタラクション用ショートカットを任意のキーに割り当てる。
-2. システム設定 > プライバシーとセキュリティ > **アクセシビリティ** で Übersicht を許可。
-3. 運用：ショートカットでインタラクションモードを ON → ヘッダ「CLAUDE 使用状況」をドラッグで移動 → OFF（位置は記憶される）。
-   - ヘッダを**ダブルクリック**で初期位置（右上）にリセット。
+パネルの「CLAUDE 使用状況」ヘッダ部分をドラッグして好きな位置に移動できます。
+位置はファイルに保存され、再起動後も維持されます。ヘッダをダブルクリックで初期位置（右上）にリセット。
 
 ---
 
 ## カスタマイズ
 
-`widget/claude-usage.jsx`（インストール後は Übersicht widgets 内のファイル）の定数を編集します。
+`~/.claude-usage-widget/claude-usage.ps1` の先頭にある定数を編集します。
 
-| 変更したいこと | 場所 |
+| 変更したいこと | 変数 |
 |----------------|------|
-| 色のしきい値（橙/赤になる%） | `const WARN = 80;` / `const DANGER = 95;` |
-| パネル幅 | `const PANEL_WIDTH = 320;` と `shellStyle.width`（両方そろえる） |
-| 画面端からの余白 | `const MARGIN = 8;` / `const MARGIN_RIGHT = 8;` |
-| 表示の更新間隔 | `export const refreshFrequency = 30000;`（ms） |
-| API 取得の間隔 / バックオフ | `backend/fetch-usage.ts` の `OK_INTERVAL_MS` / `BACKOFF_MS` |
-
-> 座標計算のロジックは `backend/lib/geometry.js`（テスト正本）とウィジェット内インラインの**二重定義**です。
-> Übersicht がウィジェットをバンドルなしで単独ロードする制約によるもので、変更時は両方を同期してください。
-
----
-
-## 開発
-
-```bash
-bun test backend/lib/
-```
-
-座標クランプ・初期位置・永続化シリアライズの単体テスト（10件）が走ります。macOS や Übersicht・Keychain には依存しないため、Linux の CI でもそのまま実行できます。
-
-設計の経緯は [`docs/design/`](docs/design/) に残してあります（設計書・実装計画）。
+| 色のしきい値（橙/赤になる%） | `$WARN = 80` / `$DANGER = 95` |
+| パネル幅 | `$PANEL_WIDTH = 320` |
+| 画面端からの余白 | `$MARGIN = 8` |
+| 表示の更新間隔 | `$REFRESH_INTERVAL_SEC = 30` |
+| API 取得の間隔 / バックオフ | `$OK_INTERVAL_SEC = 300` / `$BACKOFF_SEC = 900` |
 
 ---
 
 ## ライセンス
 
-[MIT](LICENSE)
+[MIT](LICENSE) — 著作権表示は [fourn9/claude-usage-widget](https://github.com/fourn9/claude-usage-widget) の LICENSE に従います。
