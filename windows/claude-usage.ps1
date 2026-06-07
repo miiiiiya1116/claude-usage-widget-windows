@@ -62,11 +62,12 @@ function Get-OAuthToken {
 
 # --- API 取得 ---
 function Fetch-Usage {
+    param([switch]$Force)
     $now = [DateTimeOffset]::UtcNow
     $cache = Load-Cache
 
-    # スロットリング
-    if ($cache -and $cache.next_fetch_after) {
+    # スロットリング（$Force 時はスキップ）
+    if (-not $Force -and $cache -and $cache.next_fetch_after) {
         try {
             $nextFetch = [DateTimeOffset]::Parse($cache.next_fetch_after)
             if ($now -lt $nextFetch) { return $cache }
@@ -424,18 +425,56 @@ function Update-UI($data) {
         return
     }
 
-    # ステータス表示
+    # ステータス表示（案3: 次回リトライ時刻 / 案4: エラー種別の詳細）
     if ($data.stale) {
         $refreshChar = [string][char]0x27F3
+        $retryText = ""
+
+        # 案3: 次回リトライまでの残り時間を計算
+        if ($data.next_fetch_after) {
+            try {
+                $nextFetch = [DateTimeOffset]::Parse($data.next_fetch_after).LocalDateTime
+                $diff = $nextFetch - [DateTime]::Now
+                if ($diff.TotalSeconds -gt 0) {
+                    $mins = [int]$diff.TotalMinutes
+                    if ($mins -gt 0) {
+                        $retryText = " (" + $mins + [string]([char]0x5206 + [char]0x5F8C) + ")"
+                    } else {
+                        $retryText = " (" + [string]([char]0x307E + [char]0x3082 + [char]0x306A + [char]0x304F) + ")"
+                    }
+                }
+            } catch {}
+        }
+
+        # 案4: エラー種別ごとの表示テキスト
         if ($data.error -eq "rate_limited(429)") {
-            $statusText.Text = $refreshChar + " " + [string]([char]0x5F85 + [char]0x6A5F + [char]0x4E2D)
+            $statusText.Text = $refreshChar + " " + [string]([char]0x5236 + [char]0x9650 + [char]0x4E2D) + $retryText
+            $statusText.ToolTip = [string]([char]0x30EC + [char]0x30FC + [char]0x30C8 + [char]0x5236 + [char]0x9650 + [char]0x4E2D) + [string]([char]0xFF08) + "429" + [string]([char]0xFF09) + [string]([char]0x3002) + [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067 + [char]0x518D + [char]0x8A66 + [char]0x884C)
+        }
+        elseif ($data.error -eq "click_to_connect") {
+            $statusText.Text = $refreshChar + " " + [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067 + [char]0x63A5 + [char]0x7D9A)
+            $statusText.ToolTip = [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067) + " API " + [string]([char]0x53D6 + [char]0x5F97 + [char]0x3092 + [char]0x958B + [char]0x59CB)
+        }
+        elseif ($data.error -and $data.error.StartsWith("http_401")) {
+            $statusText.Text = [string]([char]0x26A0) + " " + [string]([char]0x8981 + [char]0x30ED + [char]0x30B0 + [char]0x30A4 + [char]0x30F3)
+            $statusText.ToolTip = [string]([char]0x8A8D + [char]0x8A3C + [char]0x5931 + [char]0x6557) + "(401)" + [string]([char]0x3002) + "claude " + [string]([char]0x3067 + [char]0x518D + [char]0x30ED + [char]0x30B0 + [char]0x30A4 + [char]0x30F3 + [char]0x3057 + [char]0x3066 + [char]0x304F + [char]0x3060 + [char]0x3055 + [char]0x3044)
+        }
+        elseif ($data.error -eq "no_credentials") {
+            $statusText.Text = [string]([char]0x26A0) + " " + [string]([char]0x30ED + [char]0x30B0 + [char]0x30A4 + [char]0x30F3 + [char]0x306A + [char]0x3057)
+            $statusText.ToolTip = "~/.claude/.credentials.json " + [string]([char]0x304C + [char]0x898B + [char]0x3064 + [char]0x304B + [char]0x308A + [char]0x307E + [char]0x305B + [char]0x3093)
+        }
+        elseif ($data.error -and $data.error.StartsWith("network")) {
+            $statusText.Text = [string]([char]0x26A0) + " " + [string]([char]0x63A5 + [char]0x7D9A + [char]0x30A8 + [char]0x30E9 + [char]0x30FC) + $retryText
+            $statusText.ToolTip = $data.error
         }
         else {
-            $statusText.Text = $refreshChar + " " + [string]([char]0x66F4 + [char]0x65B0 + [char]0x5F85 + [char]0x3061)
+            $statusText.Text = $refreshChar + " " + [string]([char]0x66F4 + [char]0x65B0 + [char]0x5F85 + [char]0x3061) + $retryText
+            $statusText.ToolTip = if ($data.error) { $data.error } else { "" }
         }
     }
     else {
         $statusText.Text = ""
+        $statusText.ToolTip = $null
     }
 
     # セッション
@@ -484,11 +523,29 @@ function Update-UI($data) {
     }
 }
 
-# --- 初回データ取得 & 表示 ---
-$initialData = Fetch-Usage
-Update-UI $initialData
+# --- 案2: 手動接続ボタン（StatusText クリックで即取得）---
+$statusText.Cursor = [System.Windows.Input.Cursors]::Hand
+$statusText.Add_MouseLeftButtonDown({
+    param($s, $e)
+    $statusText.Text = [string]([char]0x27F3) + " " + [string]([char]0x53D6 + [char]0x5F97 + [char]0x4E2D) + "..."
+    $statusText.ToolTip = $null
+    $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+    $data = Fetch-Usage -Force
+    Update-UI $data
+})
 
-# --- タイマーで定期更新 ---
+# --- 初回表示（キャッシュだけ表示、APIは叩かない）---
+$initialCache = Load-Cache
+if ($initialCache) {
+    $initialCache.stale = $true
+    if (-not $initialCache.error) { $initialCache.error = "click_to_connect" }
+    Update-UI $initialCache
+} else {
+    $statusText.Text = [string]([char]0x27F3) + " " + [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067 + [char]0x63A5 + [char]0x7D9A)
+    $statusText.ToolTip = [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067) + " API " + [string]([char]0x53D6 + [char]0x5F97 + [char]0x3092 + [char]0x958B + [char]0x59CB)
+}
+
+# --- 定期更新タイマー（手動接続後 or 自動では動かさない、30秒ごとにUI更新のみ）---
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds($REFRESH_INTERVAL_SEC)
 $timer.Add_Tick({
