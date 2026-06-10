@@ -189,7 +189,11 @@ function Load-Position {
     if (Test-Path $POS_FILE) {
         try {
             $p = Get-Content $POS_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($null -ne $p.x -and $null -ne $p.y) { return $p }
+            if ($null -ne $p.x -and $null -ne $p.y) {
+                $minimized = $false
+                if ($null -ne $p.minimized) { $minimized = [bool]$p.minimized }
+                return @{ x = [int]$p.x; y = [int]$p.y; minimized = $minimized }
+            }
         }
         catch {}
     }
@@ -200,11 +204,18 @@ function Get-InitialPosition {
     $workArea = [System.Windows.SystemParameters]::WorkArea
     $x = [Math]::Max($workArea.Left, $workArea.Right - $PANEL_WIDTH - $MARGIN_RIGHT)
     $y = $workArea.Top + $MARGIN
-    return @{ x = [int]$x; y = [int]$y }
+    return @{ x = [int]$x; y = [int]$y; minimized = $false }
 }
 
 function Save-Position($pos) {
-    try { $pos | ConvertTo-Json | Set-Content $POS_FILE -Encoding UTF8 }
+    try {
+        $payload = @{
+            x = [int]$pos.x
+            y = [int]$pos.y
+            minimized = [bool]$pos.minimized
+        }
+        $payload | ConvertTo-Json | Set-Content $POS_FILE -Encoding UTF8
+    }
     catch {}
 }
 
@@ -259,14 +270,25 @@ function Get-ResetClock($resetsAt) {
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Name="TitleText" Grid.Column="0"
                            Text="CLAUDE" FontSize="11" FontWeight="Bold"
                            Foreground="#D9E8E8EA" VerticalAlignment="Center"/>
-                <TextBlock Name="StatusText" Grid.Column="1"
+                <TextBlock Name="MiniTotalText" Grid.Column="1"
+                           Text="" FontSize="11" FontWeight="SemiBold"
+                           Foreground="#D9E8E8EA" VerticalAlignment="Center"
+                           Margin="8,0,0,0" Visibility="Collapsed"/>
+                <TextBlock Name="MinimizeBtn" Grid.Column="2"
+                           Text="-" FontSize="12" FontWeight="Bold"
+                           Foreground="#99E8E8EA" VerticalAlignment="Center"
+                           Margin="8,0,0,0" Cursor="Hand" ToolTip="最小化"/>
+                <TextBlock Name="StatusText" Grid.Column="3"
                            Text="" FontSize="10" Foreground="#80E8E8EA"
-                           VerticalAlignment="Center"/>
+                           VerticalAlignment="Center" Margin="8,0,0,0"/>
             </Grid>
+            <StackPanel Name="DetailPanel">
             <Grid Margin="0,0,0,2">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -314,6 +336,7 @@ function Get-ResetClock($resetsAt) {
             </Border>
             <TextBlock Name="OpusSub" FontSize="11"
                        Foreground="#99E8E8EA" Visibility="Collapsed"/>
+            </StackPanel>
         </StackPanel>
     </Border>
 </Window>
@@ -323,9 +346,12 @@ $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # 名前付き要素の取得
-$header      = $window.FindName("Header")
-$titleText   = $window.FindName("TitleText")
-$statusText  = $window.FindName("StatusText")
+$header        = $window.FindName("Header")
+$titleText     = $window.FindName("TitleText")
+$miniTotalText = $window.FindName("MiniTotalText")
+$minimizeBtn   = $window.FindName("MinimizeBtn")
+$detailPanel   = $window.FindName("DetailPanel")
+$statusText    = $window.FindName("StatusText")
 $sessionLabel = $window.FindName("SessionLabel")
 $sessionPct  = $window.FindName("SessionPct")
 $sessionBar  = $window.FindName("SessionBar")
@@ -352,6 +378,46 @@ $pos = Load-Position
 $window.Left = $pos.x
 $window.Top  = $pos.y
 
+$script:isMinimized = $false
+
+function Set-WidgetMinimized($minimized) {
+    $script:isMinimized = [bool]$minimized
+    if ($script:isMinimized) {
+        $detailPanel.Visibility = "Collapsed"
+        $miniTotalText.Visibility = "Visible"
+        $minimizeBtn.Text = "+"
+        $minimizeBtn.ToolTip = [string]([char]0x5C55 + [char]0x958B)
+        $header.Margin = "0,0,0,0"
+    }
+    else {
+        $detailPanel.Visibility = "Visible"
+        $miniTotalText.Visibility = "Collapsed"
+        $minimizeBtn.Text = "-"
+        $minimizeBtn.ToolTip = [string]([char]0x6700 + [char]0x5C0F + [char]0x5316)
+        $header.Margin = "0,0,0,6"
+    }
+    Save-Position @{ x = [int]$window.Left; y = [int]$window.Top; minimized = $script:isMinimized }
+}
+
+function Update-MiniTotal($slot) {
+    $dash = [string][char]0x2014
+    if ($slot -and $null -ne $slot.pct) {
+        $pctVal = [Math]::Round([double]$slot.pct)
+        $miniTotalText.Text = "$pctVal%"
+        $miniTotalText.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString((Get-BarColor $pctVal))
+    }
+    else {
+        $miniTotalText.Text = $dash
+        $miniTotalText.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#D9E8E8EA")
+    }
+}
+
+$minimizeBtn.Add_MouseLeftButtonDown({
+    param($s, $e)
+    $e.Handled = $true
+    Set-WidgetMinimized (-not $script:isMinimized)
+})
+
 # --- ドラッグ ---
 $script:isDragging = $false
 $script:dragOffset = @{ x = 0; y = 0 }
@@ -362,7 +428,7 @@ $header.Add_MouseLeftButtonDown({
         $initPos = Get-InitialPosition
         $window.Left = $initPos.x
         $window.Top  = $initPos.y
-        Save-Position $initPos
+        Save-Position @{ x = $initPos.x; y = $initPos.y; minimized = $script:isMinimized }
         return
     }
     $script:isDragging = $true
@@ -384,7 +450,7 @@ $header.Add_MouseMove({
     # WPF の WorkArea で制限（DPI に依存しない座標）
     $workArea = [System.Windows.SystemParameters]::WorkArea
     $panelH = $window.ActualHeight
-    if ($panelH -lt 10) { $panelH = 150 }
+    if ($panelH -lt 10) { $panelH = if ($script:isMinimized) { 36 } else { 150 } }
     $minX = $workArea.Left + $MARGIN
     $minY = $workArea.Top + $MARGIN
     $maxX = $workArea.Right - $PANEL_WIDTH - $MARGIN
@@ -399,7 +465,7 @@ $header.Add_MouseLeftButtonUp({
     if (-not $script:isDragging) { return }
     $script:isDragging = $false
     $header.ReleaseMouseCapture()
-    Save-Position @{ x = [int]$window.Left; y = [int]$window.Top }
+    Save-Position @{ x = [int]$window.Left; y = [int]$window.Top; minimized = $script:isMinimized }
 })
 
 # --- UI 更新関数 ---
@@ -409,6 +475,7 @@ function Update-UI($data) {
 
     if (-not $data) {
         $titleText.Text = "Claude " + [string]([char]0x4F7F + [char]0x7528 + [char]0x72B6 + [char]0x6CC1) + ": " + [string]([char]0x8AAD + [char]0x307F + [char]0x8FBC + [char]0x307F + [char]0x4E2D) + "..."
+        Update-MiniTotal $null
         return
     }
 
@@ -422,6 +489,7 @@ function Update-UI($data) {
         $weeklyPct.Text = $dash
         $weeklyBar.Width = 0
         $weeklySub.Text = ""
+        Update-MiniTotal $null
         return
     }
 
@@ -521,6 +589,8 @@ function Update-UI($data) {
         $opusBarContainer.Visibility = "Collapsed"
         $opusSub.Visibility = "Collapsed"
     }
+
+    Update-MiniTotal $data.session
 }
 
 # --- 案2: 手動接続ボタン（StatusText クリックで即取得）---
@@ -533,6 +603,8 @@ $statusText.Add_MouseLeftButtonDown({
     $data = Fetch-Usage -Force
     Update-UI $data
 })
+
+Set-WidgetMinimized $pos.minimized
 
 # --- 初回表示（キャッシュだけ表示、APIは叩かない）---
 $initialCache = Load-Cache

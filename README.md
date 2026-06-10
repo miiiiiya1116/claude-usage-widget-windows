@@ -136,6 +136,10 @@ powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\.claude-usage-widget\cla
 パネルの「CLAUDE 使用状況」ヘッダ部分をドラッグして好きな位置に移動できます。
 位置はファイルに保存され、再起動後も維持されます。ヘッダをダブルクリックで初期位置（右上）にリセット。
 
+ヘッダ右側の **`-`** をクリックすると詳細を折りたたみ、コンパクト表示（セッション % のみ）になります。**`+`** をクリックで再展開します。最小化状態も再起動後に維持されます。
+
+デスクトップ（作業領域）の外には移動できません。
+
 ---
 
 ## カスタマイズ
@@ -149,6 +153,14 @@ powershell -ExecutionPolicy Bypass -File "%USERPROFILE%\.claude-usage-widget\cla
 | 画面端からの余白 | `$MARGIN = 8` |
 | 表示の更新間隔 | `$REFRESH_INTERVAL_SEC = 30` |
 | API 取得の間隔 / バックオフ | `$OK_INTERVAL_SEC = 300` / `$BACKOFF_SEC = 900` |
+
+---
+
+## 更新履歴
+
+### 2026-06-10
+
+- ヘッダー右側の `-` / `+` ボタンでパネルを最小化（折りたたみ）できるようにした。最小化時はセッション % のみコンパクト表示し、状態は `position.json` に保存して再起動後も維持する。
 
 ---
 
