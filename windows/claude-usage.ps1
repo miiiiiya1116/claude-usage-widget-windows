@@ -1,5 +1,5 @@
-# Claude Code 使用状況ウィジェット (Windows / PowerShell + WPF)
-# デスクトップ右上に半透明パネルで使用率を常時表示する。
+﻿# Claude Code 使用状況ウィジェット (Windows / PowerShell + WPF)
+# システムトレイに使用率(%)を常時表示し、トレイアイコンのクリックで詳細パネルを開閉する。
 # 追加インストール不要（Windows 標準の PowerShell 5.1 + .NET Framework で動作）。
 
 # --- 設定 ---
@@ -40,6 +40,18 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+if (-not ([System.Management.Automation.PSTypeName]"ClaudeUsageNativeIcon").Type) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class ClaudeUsageNativeIcon {
+    [DllImport("user32.dll")]
+    public static extern bool DestroyIcon(IntPtr hIcon);
+}
+"@
+}
 
 # --- トークン読み取り ---
 function Get-OAuthToken {
@@ -249,6 +261,113 @@ function Get-ResetClock($resetsAt) {
         return ("{0}/{1}({2}) {3}:{4} " -f $d.Month, $d.Day, $wd, $d.Hour, $min) + [string]([char]0x30EA + [char]0x30BB + [char]0x30C3 + [char]0x30C8)
     }
     catch { return [string][char]0x2014 }
+}
+
+# --- トレイアイコン描画 ---
+function ConvertTo-DrawingColor($argbHex) {
+    $h = $argbHex.TrimStart('#')
+    $a = [Convert]::ToInt32($h.Substring(0, 2), 16)
+    $r = [Convert]::ToInt32($h.Substring(2, 2), 16)
+    $g = [Convert]::ToInt32($h.Substring(4, 2), 16)
+    $b = [Convert]::ToInt32($h.Substring(6, 2), 16)
+    return [System.Drawing.Color]::FromArgb($a, $r, $g, $b)
+}
+
+function New-TrayIcon($text, $argbHex) {
+    $size = 32
+    $bmp = New-Object System.Drawing.Bitmap($size, $size)
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+            $g.Clear([System.Drawing.Color]::Transparent)
+            $bgColor = ConvertTo-DrawingColor $argbHex
+            $brush = New-Object System.Drawing.SolidBrush($bgColor)
+            $g.FillEllipse($brush, 0, 0, $size, $size)
+
+            # トレイアイコンは実際には16px前後に縮小されて表示されるため、
+            # 32px canvas 上でも縮小後に欠けないようテキスト幅を測って収まる最大フォントサイズを選ぶ
+            $fmt = New-Object System.Drawing.StringFormat
+            $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+            $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $maxWidth = $size - ($size * 0.10)
+            $font = $null
+            for ($fs = [Math]::Ceiling($size * 0.85); $fs -ge 5; $fs--) {
+                $candidate = New-Object System.Drawing.Font("Segoe UI", $fs, [System.Drawing.FontStyle]::Bold)
+                $measured = $g.MeasureString($text, $candidate)
+                if ($measured.Width -le $maxWidth) {
+                    $font = $candidate
+                    break
+                }
+                $candidate.Dispose()
+            }
+            if (-not $font) { $font = New-Object System.Drawing.Font("Segoe UI", 5, [System.Drawing.FontStyle]::Bold) }
+
+            $rect = New-Object System.Drawing.RectangleF(0, 0, $size, $size)
+            $g.DrawString($text, $font, [System.Drawing.Brushes]::White, $rect, $fmt)
+            $font.Dispose()
+            $brush.Dispose()
+        }
+        finally { $g.Dispose() }
+
+        $hIcon = $bmp.GetHicon()
+        try {
+            $tempIcon = [System.Drawing.Icon]::FromHandle($hIcon)
+            $ownedIcon = $tempIcon.Clone()
+            $tempIcon.Dispose()
+            return $ownedIcon
+        }
+        finally {
+            [ClaudeUsageNativeIcon]::DestroyIcon($hIcon) | Out-Null
+        }
+    }
+    finally {
+        $bmp.Dispose()
+    }
+}
+
+function Update-TrayIcon($sessionSlot) {
+    if (-not $script:trayIcon) { return }
+    $text = [string][char]0x3F
+    $argbHex = "#FF808080"
+    if ($sessionSlot -and $null -ne $sessionSlot.pct) {
+        $pctVal = [Math]::Round([double]$sessionSlot.pct)
+        $text = [string]$pctVal
+        $argbHex = Get-BarColor $pctVal
+    }
+    $newIcon = New-TrayIcon $text $argbHex
+    $oldIcon = $script:trayIcon.Icon
+    $script:trayIcon.Icon = $newIcon
+    if ($oldIcon) { $oldIcon.Dispose() }
+}
+
+function Update-TrayTooltip($data) {
+    if (-not $script:trayIcon) { return }
+    $lines = @("Claude")
+    if ($data -and $data.session -and $null -ne $data.session.pct) {
+        $sessionLine = [string]([char]0x30BB + [char]0x30C3 + [char]0x30B7 + [char]0x30E7 + [char]0x30F3) + " " + [Math]::Round([double]$data.session.pct) + "%"
+        if ($data.session.resets_at) {
+            $sessionLine += [string]([char]0xFF08) + (Get-Countdown $data.session.resets_at) + [string]([char]0xFF09)
+        }
+        $lines += $sessionLine
+    }
+    if ($data -and $data.weekly -and $null -ne $data.weekly.pct) {
+        $lines += ([string]([char]0x9031 + [char]0x9593) + " " + [Math]::Round([double]$data.weekly.pct) + "%")
+    }
+    if ($data -and $data.weekly_opus -and $null -ne $data.weekly_opus.pct) {
+        $lines += ("Opus " + [Math]::Round([double]$data.weekly_opus.pct) + "%")
+    }
+    $text = ($lines -join "`n")
+    if ($text.Length -gt 63) { $text = $text.Substring(0, 63) }
+    $script:trayIcon.Text = $text
+}
+
+function Sync-TrayIcon($data) {
+    $sessionSlot = $null
+    if ($data -and $data.session) { $sessionSlot = $data.session }
+    Update-TrayIcon $sessionSlot
+    Update-TrayTooltip $data
 }
 
 # --- WPF UI 構築 ---
@@ -470,6 +589,8 @@ $header.Add_MouseLeftButtonUp({
 
 # --- UI 更新関数 ---
 function Update-UI($data) {
+    Sync-TrayIcon $data
+
     $dash = [string][char]0x2014
     $barMaxWidth = $PANEL_WIDTH - 24
 
@@ -605,6 +726,53 @@ $statusText.Add_MouseLeftButtonDown({
 })
 
 Set-WidgetMinimized $pos.minimized
+$window.Hide()
+
+# --- システムトレイ ---
+$script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
+$script:trayIcon.Text = "Claude"
+$script:trayIcon.Visible = $true
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$exitMenuItem = $trayMenu.Items.Add([string]([char]0x7D42 + [char]0x4E86))
+$script:trayIcon.ContextMenuStrip = $trayMenu
+
+function Show-Popup {
+    $window.Show()
+    $window.Activate()
+}
+
+function Hide-Popup {
+    $window.Hide()
+}
+
+$script:trayIcon.Add_MouseClick({
+    param($s, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        if ($window.Visibility -eq [System.Windows.Visibility]::Visible) {
+            Hide-Popup
+        }
+        else {
+            Show-Popup
+        }
+    }
+})
+
+$exitMenuItem.Add_Click({
+    $timer.Stop()
+    $script:trayIcon.Visible = $false
+    [System.Windows.Forms.Application]::Exit()
+})
+
+$window.Add_Deactivated({
+    Hide-Popup
+})
+
+$window.Add_Closing({
+    param($s, $e)
+    $e.Cancel = $true
+    Hide-Popup
+})
 
 # --- 初回表示（キャッシュだけ表示、APIは叩かない）---
 $initialCache = Load-Cache
@@ -613,6 +781,7 @@ if ($initialCache) {
     if (-not $initialCache.error) { $initialCache.error = "click_to_connect" }
     Update-UI $initialCache
 } else {
+    Sync-TrayIcon $null
     $statusText.Text = [string]([char]0x27F3) + " " + [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067 + [char]0x63A5 + [char]0x7D9A)
     $statusText.ToolTip = [string]([char]0x30AF + [char]0x30EA + [char]0x30C3 + [char]0x30AF + [char]0x3067) + " API " + [string]([char]0x53D6 + [char]0x5F97 + [char]0x3092 + [char]0x958B + [char]0x59CB)
 }
@@ -626,9 +795,8 @@ $timer.Add_Tick({
 })
 $timer.Start()
 
-# --- ウィンドウ表示 ---
-$window.ShowDialog() | Out-Null
+[System.Windows.Forms.Application]::Run()
 
-# Mutex 解放
+$script:trayIcon.Dispose()
 try { $script:widgetMutex.ReleaseMutex() } catch {}
 $script:widgetMutex.Dispose()
